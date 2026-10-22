@@ -1,4 +1,23 @@
 const STORAGE_KEY = "index";
+const TABLE = "index_documents";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const supabase = window.supabase.createClient(
+  window.INDEX_SUPABASE.url,
+  window.INDEX_SUPABASE.anonKey,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      storage: {
+        getItem: () => null,
+        setItem: () => {},
+        removeItem: () => {},
+      },
+    },
+  },
+);
 
 const listEl = document.getElementById("list");
 const addEl = document.getElementById("add");
@@ -6,6 +25,8 @@ const menuEl = document.getElementById("menu");
 const statusEl = document.getElementById("status");
 
 let documents = [];
+let ready = false;
+let cloudQueue = Promise.resolve(true);
 let freshIds = new Set();
 let editing = null;
 let editSnapshot = null;
@@ -15,9 +36,13 @@ function newId() {
   return crypto.randomUUID();
 }
 
+function isUuid(value) {
+  return typeof value === "string" && UUID_RE.test(value);
+}
+
 function normalizeNote(note) {
   return {
-    id: typeof note.id === "string" && note.id ? note.id : newId(),
+    id: isUuid(note.id) ? note.id : newId(),
     text: typeof note.text === "string" ? note.text : "",
   };
 }
@@ -25,14 +50,14 @@ function normalizeNote(note) {
 function normalizeDoc(doc) {
   const notes = Array.isArray(doc.notes) ? doc.notes : [];
   return {
-    id: typeof doc.id === "string" && doc.id ? doc.id : newId(),
+    id: isUuid(doc.id) ? doc.id : newId(),
     title: typeof doc.title === "string" ? doc.title : "",
     number: typeof doc.number === "string" ? doc.number : "",
     notes: notes.filter((note) => note && typeof note === "object").map(normalizeNote),
   };
 }
 
-function load() {
+function loadLocal() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
@@ -44,8 +69,80 @@ function load() {
   }
 }
 
-function save() {
+function saveLocal() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(documents));
+}
+
+function toRow(doc, index) {
+  return {
+    id: doc.id,
+    title: doc.title,
+    number: doc.number,
+    notes: doc.notes.map((note) => ({ id: note.id, text: note.text })),
+    position: index,
+  };
+}
+
+function enqueue(task) {
+  const run = cloudQueue.then(task, task);
+  cloudQueue = run.then(
+    (ok) => ok !== false,
+    () => false,
+  );
+  return run;
+}
+
+function saveCloud() {
+  return enqueue(async () => {
+    if (!documents.length) return true;
+    const { error } = await supabase.from(TABLE).upsert(documents.map(toRow));
+    if (error) {
+      console.error(error);
+      return false;
+    }
+    return true;
+  });
+}
+
+function deleteCloud(id) {
+  return enqueue(async () => {
+    const { error } = await supabase.from(TABLE).delete().eq("id", id);
+    if (error) {
+      console.error(error);
+      return false;
+    }
+    if (documents.length) {
+      const { error: orderError } = await supabase.from(TABLE).upsert(documents.map(toRow));
+      if (orderError) {
+        console.error(orderError);
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+async function loadCloud() {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("id, title, number, notes, position")
+    .order("position", { ascending: true });
+  if (error) throw error;
+  return (data || []).map(normalizeDoc);
+}
+
+function mergeDocuments(cloud, local) {
+  const ids = new Set(cloud.map((doc) => doc.id));
+  const merged = cloud.slice();
+  for (const doc of local) {
+    if (!ids.has(doc.id)) merged.push(doc);
+  }
+  return merged;
+}
+
+function save() {
+  saveLocal();
+  return saveCloud();
 }
 
 function findDoc(id) {
@@ -180,7 +277,8 @@ function removeDoc(docId) {
     editSnapshot = null;
   }
   documents = documents.filter((doc) => doc.id !== docId);
-  save();
+  saveLocal();
+  deleteCloud(docId);
   render();
 }
 
@@ -403,7 +501,10 @@ function render() {
   for (const doc of documents) listEl.append(rowEl(doc));
 }
 
-addEl.addEventListener("click", addDocument);
+addEl.addEventListener("click", () => {
+  if (!ready) return;
+  addDocument();
+});
 
 menuEl.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
@@ -430,5 +531,19 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("resize", hideMenu);
 window.addEventListener("scroll", hideMenu, true);
 
-documents = load();
-render();
+async function boot() {
+  const local = loadLocal();
+  try {
+    const cloud = await loadCloud();
+    documents = mergeDocuments(cloud, local);
+    saveLocal();
+    if (documents.length !== cloud.length) await saveCloud();
+  } catch (error) {
+    console.error(error);
+    documents = local;
+  }
+  ready = true;
+  render();
+}
+
+boot();
